@@ -365,6 +365,20 @@ public:
       int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
       unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
       // save key frame transformations
+      ofstream outFile(saveMapDirectory + "/path_data.txt");
+      // Iterate through the poses in the Path message
+      for (const auto& poseStamped : globalPath.poses)
+      {
+          // Write the timestamp (header.stamp) and pose data to the file
+          outFile << poseStamped.header.stamp << ' ' << poseStamped.pose.position.x << ' ' << ' ' << poseStamped.pose.position.y << ' ' << poseStamped.pose.position.z 
+          << ' ' << poseStamped.pose.orientation.x << ' ' << poseStamped.pose.orientation.y << ' ' << poseStamped.pose.orientation.z 
+          << ' ' << poseStamped.pose.orientation.w << ' ' << endl;
+      }
+      // Close the file
+      outFile.close();
+      cout << "Path data saved to path_data.txt as:" << endl;
+      cout << "[time x y z q_x q_y q_z q_w]" << endl;
+      // save key frame transformations
       pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
       pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
       // extract global point cloud map
