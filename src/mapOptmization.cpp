@@ -16,6 +16,7 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+#include <sensor_msgs/NavSatFix.h>
 
 using namespace gtsam;
 
@@ -45,6 +46,23 @@ POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
                                    (double, time, time))
 
 typedef PointXYZIRPYT  PointTypePose;
+
+
+struct PointXYZID {
+    double x;
+    double y;
+    double z; 
+    double intensity; 
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW   // make sure our new allocators are aligned
+} EIGEN_ALIGN16;                    // enforce SSE padding for correct memory alignment
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(
+    PointXYZID, 
+    (double, x, x)
+    (double, y, y)
+    (double, z, z)
+    (double, intensity, intensity)
+)
 
 
 class mapOptimization : public ParamServer
@@ -77,6 +95,7 @@ public:
 
     ros::Subscriber subCloud;
     ros::Subscriber subGPS;
+    ros::Subscriber subGNSSReceiver;
     ros::Subscriber subLoop;
 
     ros::ServiceServer srvSaveMap;
@@ -153,6 +172,7 @@ public:
     Eigen::Affine3f incrementalOdometryAffineFront;
     Eigen::Affine3f incrementalOdometryAffineBack;
 
+    float datumGNSS[3]; 
 
     mapOptimization()
     {
@@ -169,6 +189,7 @@ public:
 
         subCloud = nh.subscribe<lio_sam::cloud_info>("lio_sam/feature/cloud_info", 1, &mapOptimization::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
         subGPS   = nh.subscribe<nav_msgs::Odometry> (gpsTopic, 200, &mapOptimization::gpsHandler, this, ros::TransportHints().tcpNoDelay());
+        subGNSSReceiver = nh.subscribe<sensor_msgs::NavSatFix> ("ublox_position_receiver/fix", 1, &mapOptimization::datumHandler, this); 
         subLoop  = nh.subscribe<std_msgs::Float64MultiArray>("lio_loop/loop_closure_detection", 1, &mapOptimization::loopInfoHandler, this, ros::TransportHints().tcpNoDelay());
 
         srvSaveMap  = nh.advertiseService("lio_sam/save_map", &mapOptimization::saveMapService, this);
@@ -189,6 +210,13 @@ public:
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
         allocateMemory();
+    }
+
+    void datumHandler(const sensor_msgs::NavSatFixConstPtr& msg){
+        datumGNSS[0] = msg->latitude; 
+        datumGNSS[1] = msg->longitude; 
+        datumGNSS[2] = msg->altitude; 
+        subGNSSReceiver.shutdown();
     }
 
     void allocateMemory()
@@ -338,24 +366,14 @@ public:
         return thisPose6D;
     }
 
-    
-
-
-
-
-
-
-
-
-
-
-
+    //void correctMapFrameOrientation(Eigen::Vector3d gnss_path, Eigen::Vector3d liosam_path) {
+    //    
+    //}
 
 
     bool saveMapService(lio_sam::save_mapRequest& req, lio_sam::save_mapResponse& res)
     {
       string saveMapDirectory;
-
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files ..." << endl;
       if(req.destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
@@ -378,7 +396,6 @@ public:
       outFile.close();
       cout << "Path data saved to path_data.txt as:" << endl;
       cout << "[time x y z q_x q_y q_z q_w]" << endl;
-      // save key frame transformations
       pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
       pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
       // extract global point cloud map
@@ -420,8 +437,57 @@ public:
       *globalMapCloud += *globalCornerCloud;
       *globalMapCloud += *globalSurfCloud;
 
+      // save global point cloud map in ECEF coordinates 
+      size_t num_points = globalMapCloud->size();
+      Eigen::MatrixXd globalMapCloudMatrix(num_points, 3); 
+      Eigen::MatrixXd intensities(num_points, 1); 
+      for (size_t i = 0; i < num_points; ++i) {
+        globalMapCloudMatrix(i, 0) = globalMapCloud->points[i].x; 
+        globalMapCloudMatrix(i, 1) = globalMapCloud->points[i].y;
+        globalMapCloudMatrix(i, 2) = globalMapCloud->points[i].z;
+        intensities(i, 0) = globalMapCloud->points[i].intensity;
+      }
+      double DEG_TO_RAD = M_PI / 180.0; 
+      double WGS84_A = 6378137.0;
+      double WGS84_E2 = 0.00669437999014;
+      double lat0_rad = datumGNSS[0]*DEG_TO_RAD;
+      double lon0_rad = datumGNSS[1]*DEG_TO_RAD;
+      double alt0 = datumGNSS[2];
+      Eigen::Matrix3d R_ENU;
+      R_ENU <<
+            -sin(lon0_rad), cos(lon0_rad), 0.0,
+            -sin(lat0_rad)*cos(lon0_rad), -sin(lat0_rad)*sin(lon0_rad), cos(lat0_rad), 
+             cos(lat0_rad)*cos(lon0_rad),  cos(lat0_rad)*sin(lon0_rad), sin(lat0_rad);
+      cout << "R_ENU: " << endl << setprecision(numeric_limits<double>::max_digits10) << R_ENU << endl;
+      Eigen::Matrix3d R_ENU_INV = R_ENU.transpose();
+      double N = WGS84_A / sqrt( 1.0 - WGS84_E2 * sin(lat0_rad) * sin(lat0_rad) );
+      double X0 = (N + alt0)*cos(lat0_rad)*cos(lon0_rad);
+      double Y0 = (N + alt0)*cos(lat0_rad)*sin(lat0_rad);
+      double Z0 = (N * (1 - WGS84_E2) + alt0) * sin(lat0_rad);
+      cout << "ENU Origin: " << setprecision(numeric_limits<double>::max_digits10) << X0 << ' ' << Y0 << ' ' << Z0 << endl;
+      Eigen::MatrixXd P0_ECEF(3,num_points);
+      for (size_t i = 0; i < num_points; ++i) {
+          P0_ECEF(0,i) = X0;
+          P0_ECEF(1,i) = Y0;
+          P0_ECEF(2,i) = Z0;
+      }
+      Eigen::MatrixXd globalMapCloudMatrix_ECEF = R_ENU_INV * globalMapCloudMatrix.transpose() + P0_ECEF; 
+      pcl::PointCloud<PointXYZID>::Ptr globalMapCloud_ECEF(new pcl::PointCloud<PointXYZID>());
+      for (size_t i = 0; i < num_points; ++i){
+          PointXYZID point; 
+          point.x = globalMapCloudMatrix_ECEF(0,i);
+          point.y = globalMapCloudMatrix_ECEF(1,i);
+          point.z = globalMapCloudMatrix_ECEF(2,i);
+          point.intensity = intensities(i); 
+          globalMapCloud_ECEF->points.push_back(point);
+      }
+      //globalMapCloud_ECEF->width = globalMapCloud_ECEF->points.size();
+      //globalMapCloud_ECEF->height = 1; 
+
       int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
-      res.success = ret == 0;
+      pcl::io::savePLYFile(saveMapDirectory + "/ECEFMap.ply", *globalMapCloud_ECEF);
+
+    res.success = ret == 0;
 
       downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
       downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
