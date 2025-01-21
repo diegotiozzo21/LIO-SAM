@@ -172,7 +172,19 @@ public:
     Eigen::Affine3f incrementalOdometryAffineFront;
     Eigen::Affine3f incrementalOdometryAffineBack;
 
+    double DEG_TO_RAD = M_PI / 180.0;
+    double WGS84_A = 6378137.0;
+    double WGS84_E2 = 0.00669437999014;
+
+
     float datumGNSS[3]; 
+    float datumLIO[3];
+    bool datumGNSSInitialized = false;
+    int numCalibrationPoints = 150;
+    Eigen::MatrixXd GNSSPathMatrix = Eigen::MatrixXd::Zero(3, numCalibrationPoints);
+    Eigen::MatrixXd LIOPathMatrix = Eigen::MatrixXd::Zero(3, numCalibrationPoints);
+    int GNSSPathCount = 0;
+    Eigen::Matrix3d R_IMUCalibration = Eigen::Matrix3d::Zero();
 
     mapOptimization()
     {
@@ -189,7 +201,7 @@ public:
 
         subCloud = nh.subscribe<lio_sam::cloud_info>("lio_sam/feature/cloud_info", 1, &mapOptimization::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
         subGPS   = nh.subscribe<nav_msgs::Odometry> (gpsTopic, 200, &mapOptimization::gpsHandler, this, ros::TransportHints().tcpNoDelay());
-        subGNSSReceiver = nh.subscribe<sensor_msgs::NavSatFix> ("ublox_position_receiver/fix", 1, &mapOptimization::datumHandler, this); 
+        subGNSSReceiver = nh.subscribe<sensor_msgs::NavSatFix> ("ublox_position_receiver/fix", 1, &mapOptimization::GNSSReceiverCallback, this);
         subLoop  = nh.subscribe<std_msgs::Float64MultiArray>("lio_loop/loop_closure_detection", 1, &mapOptimization::loopInfoHandler, this, ros::TransportHints().tcpNoDelay());
 
         srvSaveMap  = nh.advertiseService("lio_sam/save_map", &mapOptimization::saveMapService, this);
@@ -212,11 +224,86 @@ public:
         allocateMemory();
     }
 
-    void datumHandler(const sensor_msgs::NavSatFixConstPtr& msg){
-        datumGNSS[0] = msg->latitude; 
-        datumGNSS[1] = msg->longitude; 
-        datumGNSS[2] = msg->altitude; 
-        subGNSSReceiver.shutdown();
+    void GNSSReceiverCallback(const sensor_msgs::NavSatFixConstPtr& msg){
+        if (!datumGNSSInitialized){
+            datumGNSSInitialized = true;
+            datumGNSS[0] = msg->latitude; 
+            datumGNSS[1] = msg->longitude; 
+            datumGNSS[2] = msg->altitude;
+        }
+        if (GNSSPathCount < numCalibrationPoints) {
+            GNSSPathMatrix(0, GNSSPathCount) = msg->latitude;
+            GNSSPathMatrix(1, GNSSPathCount) = msg->longitude; 
+            GNSSPathMatrix(2, GNSSPathCount) = msg->altitude;
+            LIOPathMatrix(0, GNSSPathCount) = transformTobeMapped[3]; 
+            LIOPathMatrix(1, GNSSPathCount) = transformTobeMapped[4]; 
+            LIOPathMatrix(2, GNSSPathCount) = transformTobeMapped[5];
+            GNSSPathCount++;
+        }
+        else {
+            subGNSSReceiver.shutdown();
+            correctMapFrameOrientation(GNSSPathMatrix, LIOPathMatrix);            
+        }        
+    }
+
+    Eigen::Vector3d latlongalt2xyz(double lat, double lon, double alt) {
+        double lat_rad = lat*DEG_TO_RAD;
+        double lon_rad = lon*DEG_TO_RAD;
+        double x = (WGS84_A / sqrt(1 - WGS84_E2 * sin(lat_rad) * sin(lat_rad)) + alt) * cos(lat_rad) * cos(lon_rad);
+        double y = (WGS84_A / sqrt(1 - WGS84_E2 * sin(lat_rad) * sin(lat_rad)) + alt) * cos(lat_rad) * sin(lon_rad);
+        double z = (WGS84_A * (1 - WGS84_E2) / sqrt(1 - WGS84_E2 * sin(lat_rad) * sin(lat_rad)) + alt) * sin(lat_rad);
+        return Eigen::Vector3d(x, y, z);
+    }
+
+    Eigen::Vector3d xyz2enu(Eigen::Vector3d xyz, Eigen::Vector3d xyz_0, Eigen::Vector3d lla_0) {
+        double lat_0 = lla_0(0)*DEG_TO_RAD;
+        double lon_0 = lla_0(1)*DEG_TO_RAD;
+        double x_0 = xyz_0(0);
+        double y_0 = xyz_0(1);
+        double z_0 = xyz_0(2);
+        double x = xyz(0);
+        double y = xyz(1);
+        double z = xyz(2);
+        double e = -sin(lon_0) * (x - x_0) + cos(lon_0) * (y - y_0);
+        double n = -sin(lat_0) * cos(lon_0) * (x - x_0) - sin(lat_0) * sin(lon_0) * (y - y_0) + cos(lat_0) * (z - z_0);
+        double u = cos(lat_0) * cos(lon_0) * (x - x_0) + cos(lat_0) * sin(lon_0) * (y - y_0) + sin(lat_0) * (z - z_0);
+        return Eigen::Vector3d(e, n, u);
+    }
+
+
+    void correctMapFrameOrientation(Eigen::MatrixXd GNSSPathMatrix, Eigen::MatrixXd LIOPathMatrix) {
+        Eigen::MatrixXd GNSSPathMatrixECEF = Eigen::MatrixXd::Zero(3, GNSSPathMatrix.cols());
+        Eigen::MatrixXd GNSSPathMatrixENU = Eigen::MatrixXd::Zero(3, GNSSPathMatrix.cols());
+        for (int i = 0; i < GNSSPathMatrix.cols(); i++) {
+            GNSSPathMatrixECEF.col(i) = latlongalt2xyz(GNSSPathMatrix(0, i), GNSSPathMatrix(1, i), GNSSPathMatrix(2, i));
+            GNSSPathMatrixENU.col(i) = xyz2enu(GNSSPathMatrixECEF.col(i), GNSSPathMatrixECEF.col(0), Eigen::Vector3d(datumGNSS[0], datumGNSS[1], datumGNSS[2]));
+        }
+        saveMatricesToFile(GNSSPathMatrixENU, LIOPathMatrix);
+        Eigen::MatrixXd P, Q;
+        Eigen::Matrix3d S = Eigen::Matrix3d::Zero();
+        P = GNSSPathMatrixENU.colwise() - GNSSPathMatrixENU.rowwise().mean();
+        Q = LIOPathMatrix.colwise() - LIOPathMatrix.rowwise().mean();
+        for (int i = 0; i < P.cols(); i++) {
+            S += P.col(i) * Q.col(i).transpose();
+        }
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd(S, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d U = svd.matrixU();
+        Eigen::Matrix3d V = svd.matrixV();
+        R_IMUCalibration = U * V.transpose();
+        ROS_INFO("\033[1;32m----> IMU Calibration Done.\033[0m");
+    }
+
+    void saveMatricesToFile(const Eigen::MatrixXd& GNSSPathMatrixENU, const Eigen::MatrixXd& LIOPathMatrix) {
+    std::ofstream file("/home/lab/mapping_ws/src/LIO-SAM/scripts/paths.txt");
+    if (file.is_open()) {
+        file << "GNSSPathMatrixENU\n";
+        file << GNSSPathMatrixENU << "\n";
+        file << "LIOPathMatrix\n";
+        file << LIOPathMatrix << "\n";
+        file.close();
+    } else {
+        std::cerr << "Unable to open file for writing\n";
+    }
     }
 
     void allocateMemory()
@@ -366,10 +453,6 @@ public:
         return thisPose6D;
     }
 
-    //void correctMapFrameOrientation(Eigen::Vector3d gnss_path, Eigen::Vector3d liosam_path) {
-    //    
-    //}
-
 
     bool saveMapService(lio_sam::save_mapRequest& req, lio_sam::save_mapResponse& res)
     {
@@ -446,10 +529,7 @@ public:
         globalMapCloudMatrix(i, 1) = globalMapCloud->points[i].y;
         globalMapCloudMatrix(i, 2) = globalMapCloud->points[i].z;
         intensities(i, 0) = globalMapCloud->points[i].intensity;
-      }
-      double DEG_TO_RAD = M_PI / 180.0; 
-      double WGS84_A = 6378137.0;
-      double WGS84_E2 = 0.00669437999014;
+      } 
       double lat0_rad = datumGNSS[0]*DEG_TO_RAD;
       double lon0_rad = datumGNSS[1]*DEG_TO_RAD;
       double alt0 = datumGNSS[2];
@@ -458,20 +538,17 @@ public:
             -sin(lon0_rad), cos(lon0_rad), 0.0,
             -sin(lat0_rad)*cos(lon0_rad), -sin(lat0_rad)*sin(lon0_rad), cos(lat0_rad), 
              cos(lat0_rad)*cos(lon0_rad),  cos(lat0_rad)*sin(lon0_rad), sin(lat0_rad);
-      cout << "R_ENU: " << endl << setprecision(numeric_limits<double>::max_digits10) << R_ENU << endl;
-      Eigen::Matrix3d R_ENU_INV = R_ENU.transpose();
       double N = WGS84_A / sqrt( 1.0 - WGS84_E2 * sin(lat0_rad) * sin(lat0_rad) );
       double X0 = (N + alt0)*cos(lat0_rad)*cos(lon0_rad);
-      double Y0 = (N + alt0)*cos(lat0_rad)*sin(lat0_rad);
+      double Y0 = (N + alt0)*cos(lat0_rad)*sin(lon0_rad);
       double Z0 = (N * (1 - WGS84_E2) + alt0) * sin(lat0_rad);
-      cout << "ENU Origin: " << setprecision(numeric_limits<double>::max_digits10) << X0 << ' ' << Y0 << ' ' << Z0 << endl;
       Eigen::MatrixXd P0_ECEF(3,num_points);
       for (size_t i = 0; i < num_points; ++i) {
           P0_ECEF(0,i) = X0;
           P0_ECEF(1,i) = Y0;
           P0_ECEF(2,i) = Z0;
       }
-      Eigen::MatrixXd globalMapCloudMatrix_ECEF = R_ENU_INV * globalMapCloudMatrix.transpose() + P0_ECEF; 
+      Eigen::MatrixXd globalMapCloudMatrix_ECEF = R_ENU.transpose() * R_IMUCalibration * globalMapCloudMatrix.transpose() + P0_ECEF; 
       pcl::PointCloud<PointXYZID>::Ptr globalMapCloud_ECEF(new pcl::PointCloud<PointXYZID>());
       for (size_t i = 0; i < num_points; ++i){
           PointXYZID point; 
@@ -481,8 +558,7 @@ public:
           point.intensity = intensities(i); 
           globalMapCloud_ECEF->points.push_back(point);
       }
-      //globalMapCloud_ECEF->width = globalMapCloud_ECEF->points.size();
-      //globalMapCloud_ECEF->height = 1; 
+
 
       int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
       pcl::io::savePLYFile(saveMapDirectory + "/ECEFMap.ply", *globalMapCloud_ECEF);
